@@ -1,0 +1,17 @@
+# Keep container Torch/CUDA/Triton/NumPy: never install x86 CUDA wheels on GH200 ARM.
+# adam-atan2 is built separately from source inside the CUDA/ARM container.
+einops==0.8.1
+tqdm==4.67.1
+coolname==2.2.0
+pydantic==2.11.7
+argdantic==1.3.3
+wandb==0.21.3
+omegaconf==2.3.0
+hydra-core==1.3.2
+setuptools==80.9.0
+setuptools-scm==9.2.0
+wheel==0.45.1
+ninja==1.13.0
+
+huggingface-hub==0.34.4
+matplotlib==3.10.6

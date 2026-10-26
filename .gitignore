@@ -1,0 +1,11 @@
+.venv*/
+.cache/
+__pycache__/
+*.pyc
+data/
+wheels/
+sources-deps/
+logs/
+results/
+configs/plan.json
+configs/resolved/

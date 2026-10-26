@@ -1,0 +1,17 @@
+#!/bin/bash
+#SBATCH --job-name=sudoku-trm
+#SBATCH --account=p26037
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:gh200:4
+#SBATCH --mem=100G
+#SBATCH --time=12:00:00
+#SBATCH --output=logs/train-%j.out
+#SBATCH --error=logs/train-%j.err
+set -euo pipefail
+export STUDY_ROOT="${SLURM_SUBMIT_DIR:?Submit from the new trm-sudoku-scaling directory}"
+cd "$STUDY_ROOT"
+source configs/cluster.env.sh
+/usr/bin/python3 scripts/launch.py "$@"

@@ -1,196 +1,142 @@
-**Update: Due to many automatically generated and irrelevant issues submitted to this repo (that have been deleted now) and our limited capacity to properly maintain this repo, we have to temporaliy archive (make read-only) this and several other repos.**
+# Sudoku TRM scaling — one experiment per job
 
+Target directory: `/work/p26037/p26037kshk/trm-sudoku-scaling`.
+Hardware: **one Kairos ARM node, four GH200 GPUs**. Every training submission runs **one configuration**. It never starts a sweep or a successor job automatically.
 
-# Less is More: Recursive Reasoning with Tiny Networks
+## 1. Install for the new account
 
-This is the codebase for the paper: "Less is More: Recursive Reasoning with Tiny Networks". TRM is a recursive reasoning approach that achieves amazing scores of 45% on ARC-AGI-1 and 8% on ARC-AGI-2 using a tiny 7M parameters neural network.
-
-[Paper](https://arxiv.org/abs/2510.04871)
-
-### Motivation
-
-Tiny Recursion Model (TRM) is a recursive reasoning model that achieves amazing scores of 45% on ARC-AGI-1 and 8% on ARC-AGI-2 with a tiny 7M parameters neural network. The idea that one must rely on massive foundational models trained for millions of dollars by some big corporation in order to achieve success on hard tasks is a trap. Currently, there is too much focus on exploiting LLMs rather than devising and expanding new lines of direction. With recursive reasoning, it turns out that “less is more”: you don’t always need to crank up model size in order for a model to reason and solve hard problems. A tiny model pretrained from scratch, recursing on itself and updating its answers over time, can achieve a lot without breaking the bank.
-
-This work came to be after I learned about the recent innovative Hierarchical Reasoning Model (HRM). I was amazed that an approach using small models could do so well on hard tasks like the ARC-AGI competition (reaching 40% accuracy when normally only Large Language Models could compete). But I kept thinking that it is too complicated, relying too much on biological arguments about the human brain, and that this recursive reasoning process could be greatly simplified and improved. Tiny Recursion Model (TRM) simplifies recursive reasoning to its core essence, which ultimately has nothing to do with the human brain, does not require any mathematical (fixed-point) theorem, nor any hierarchy.
-
-### How TRM works
-
-<p align="center">
-  <img src="https://AlexiaJM.github.io/assets/images/TRM_fig.png" alt="TRM"  style="width: 30%;">
-</p>
-
-Tiny Recursion Model (TRM) recursively improves its predicted answer y with a tiny network. It starts with the embedded input question x and initial embedded answer y and latent z. For up to K improvements steps, it tries to improve its answer y. It does so by i) recursively updating n times its latent z given the question x, current answer y, and current latent z (recursive reasoning), and then ii) updating its answer y given the current answer y and current latent z. This recursive process allows the model to progressively improve its answer (potentially addressing any errors from its previous answer) in an extremely parameter-efficient manner while minimizing overfitting.
-
-### Requirements
-
-Installation should take a few minutes. For the smallest experiments on Sudoku-Extreme (pretrain_mlp_t_sudoku), you need 1 GPU with enough memory. With 1 L40S (48Gb Ram), it takes around 18h to finish. In case that you run into issues due to library versions, here is the requirements with the exact versions used: [specific_requirements.txt](https://github.com/SamsungSAILMontreal/TinyRecursiveModels/blob/main/specific_requirements.txt).
-
-- Python 3.10 (or similar)
-- Cuda 12.6.0 (or similar)
+Copy `trm-sudoku-scaling.zip` to `/work/p26037/p26037kshk`, then run on the internet-connected login node:
 
 ```bash
-pip install --upgrade pip wheel setuptools
-pip install --pre --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126 # install torch based on your cuda version
-pip install -r requirements.txt # install requirements
-pip install --no-cache-dir --no-build-isolation adam-atan2 
-wandb login YOUR-LOGIN # login if you want the logger to sync results to your Weights & Biases (https://wandb.ai/)
+cd /work/p26037/p26037kshk
+unzip -n trm-sudoku-scaling.zip
+cd trm-sudoku-scaling
+mkdir -p logs
+export TRM_PYTHON_MINOR=312
+bash scripts/download_wheels.sh
+python3 scripts/repro_data.py download-sudoku
+sbatch slurm/setup.sbatch
 ```
 
-### Dataset Preparation
+Wait for the setup job to succeed. It creates **this account's own** `.venv-arm` inside the shared ARM container, builds the native CUDA optimizer, and prepares Sudoku. It does not use another user's Python installation. A login-node `.venv-download` is only for downloads; do not activate it in GPU jobs.
+
+Required cluster facilities: `apptainer`, Slurm account `p26037`, partition `gpu`, `gpu:gh200` resources and read access to `/work/conteneurs/shared/AI/nemo_25.04.03_arm.sif`. The container supplies Python 3.12, CUDA, PyTorch and Triton. `configs/cluster.env.sh` sets the paths; change `TRM_CONTAINER` there if the administrator provides a different compatible image. Torch/CUDA are not replaced by downloaded wheels. If the new user lacks the account allocation or filesystem permissions, those must be granted by the cluster administrator.
+
+A successful build creates `data/paper/sudoku-extreme-1k-aug-800/DATA_READY.json`. An interrupted build remains in the adjacent `.building` directory and is never accepted as ready; inspect that directory before deleting it and retrying setup.
+
+## 2. Profile once to establish a common batch and training budget
 
 ```bash
-# ARC-AGI-1
-python -m dataset.build_arc_dataset \
-  --input-file-prefix kaggle/combined/arc-agi \
-  --output-dir data/arc1concept-aug-1000 \
-  --subsets training evaluation concept \
-  --test-set-name evaluation
-
-# ARC-AGI-2
-python -m dataset.build_arc_dataset \
-  --input-file-prefix kaggle/combined/arc-agi \
-  --output-dir data/arc2concept-aug-1000 \
-  --subsets training2 evaluation2 concept \
-  --test-set-name evaluation2
-
-## Note: You cannot train on both ARC-AGI-1 and ARC-AGI-2 and evaluate them both because ARC-AGI-2 training data contains some ARC-AGI-1 eval data
-
-# Sudoku-Extreme
-python dataset/build_sudoku_dataset.py --output-dir data/sudoku-extreme-1k-aug-1000  --subsample-size 1000 --num-aug 1000  # 1000 examples, 1000 augments
-
-# Maze-Hard
-python dataset/build_maze_dataset.py # 1000 examples, 8 augments
+sbatch slurm/profile.sbatch
 ```
 
-## Experiments
+This is hardware calibration, not a completed scientific experiment. It submits no training jobs. The profile uses fresh, discarded model weights and:
 
-### Sudoku-Extreme (assuming 1 L40S GPU):
+- Tests global batches 384, 768, 1536, 3072, 6144 and 8192, stopping growth at failure or less than **20% memory headroom**; tries 192 if necessary. `--max-batch` limits the search.
+- Profiles the largest untied model, then checks the selected batch on the deepest native cases, tied full-gradient control and preliminary configuration.
+- Measures 20 warm-up updates, 40 timed native optimizer/EMA updates, a diagnostic update, and three timed full 16-step EMA evaluation batches after one warm-up batch. Training model, optimizer and EMA remain resident during evaluation.
+- Chooses the fastest tested safe batch by projected training plus evaluation time. A larger batch need not be faster. This is a bounded search, not proof of a global optimum or a guarantee against every OOM.
+- Keeps **one batch and one epoch budget** for the planned axes. Keeps 50,000 epochs if they fit; otherwise reduces the common epoch count, rounded to a multiple of 10. It retains ten evaluations and at least 4,000 optimizer updates, including 2,000 warm-up updates. It fails rather than creating a plan that misses these checks.
+
+The result is `configs/plan.json`. It contains the selected batch, epochs, projected times and profile provenance. Estimates include a 25% compute allowance and target **10 hours**, leaving two hours inside the 12-hour job for startup, checkpoints and uncertainty. They exclude queue time. GPU capture, I/O and learned halting can change actual runtime; the first completed run is the stronger timing measurement. No measured GH200 runtime is bundled with this code.
+
+The default profiling bounds are k ≤ 6 at T=3 for axes 1/3, and k=3 with T ≤ 4 for axis 2. To preselect another fixed k for axis 2 before profiling:
 
 ```bash
-run_name="pretrain_mlp_t_sudoku"
-python pretrain.py \
-arch=trm \
-data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-evaluators="[]" \
-epochs=50000 eval_interval=5000 \
-lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
-arch.mlp_t=True arch.pos_encodings=none \
-arch.L_layers=2 \
-arch.H_cycles=3 arch.L_cycles=6 \
-+run_name=${run_name} ema=True
-
-Expected: Around 87% exact-accuracy (+- 2%)
-
-run_name="pretrain_att_sudoku"
-python pretrain.py \
-arch=trm \
-data_paths="[data/sudoku-extreme-1k-aug-1000]" \
-evaluators="[]" \
-epochs=50000 eval_interval=5000 \
-lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
-arch.L_layers=2 \
-arch.H_cycles=3 arch.L_cycles=6 \
-+run_name=${run_name} ema=True
+sbatch slurm/profile.sbatch --axis2-k 4
 ```
 
-Expected: Around 75% exact-accuracy (+- 2%)
+The profiler refuses to replace an existing plan. Preserve the plan while collecting an axis. Changes to width, k/T beyond these bounds, batch or compilation mode invalidate its memory/time estimate.
 
-*Runtime:* < 20 hours
+## 3. Run one experiment at a time
 
-### Maze-Hard (assuming 4 L40S GPUs):
+Start with the reduced-depth preliminary experiment (width 256, **k=1 → native N=2**, T=3):
 
 ```bash
-run_name="pretrain_att_maze30x30"
-torchrun --nproc-per-node 4 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 pretrain.py \
-arch=trm \
-data_paths="[data/maze-30x30-hard-1k]" \
-evaluators="[]" \
-epochs=50000 eval_interval=5000 \
-lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 \
-arch.L_layers=2 \
-arch.H_cycles=3 arch.L_cycles=4 \
-+run_name=${run_name} ema=True
+sbatch slurm/train.sbatch --axis preliminary --k 1 --t 3
 ```
 
-*Runtime:* < 24 hours
-
-Actually, you can run Maze-Hard with 1 L40S GPU by reducing the batch-size with no noticable loss in performance:
+Then run each desired configuration separately. These are examples, not a script that starts the whole sweep:
 
 ```bash
-run_name="pretrain_att_maze30x30_1gpu"
-python pretrain.py \
-arch=trm \
-data_paths="[data/maze-30x30-hard-1k]" \
-evaluators="[]" \
-epochs=50000 eval_interval=5000 \
-lr=1e-4 puzzle_emb_lr=1e-4 weight_decay=1.0 puzzle_emb_weight_decay=1.0 global_batch_size=128 \
-arch.L_layers=2 \
-arch.H_cycles=3 arch.L_cycles=4 \
-+run_name=${run_name} ema=True
+# Axis 1: vary paper-table k over 1, 2, 4, 6; T remains 3.
+sbatch slurm/train.sbatch --axis 1 --k 2
+
+# Axis 2: vary T over 1, 2, 3, 4; keep k=3 (native N=6).
+sbatch slurm/train.sbatch --axis 2 --k 3 --t 2
+
+# Axis 3: run each arm separately at the SAME k, T, width, batch and epochs.
+sbatch slurm/train.sbatch --axis 3 --k 2 --t 3 --arm tied_full
+sbatch slurm/train.sbatch --axis 3 --k 2 --t 3 --arm untied_full
 ```
 
-*Runtime:* < 24 hours
+For axis 3, repeat the pair for k=1, 2, 4, 6. There are 16 unique planned runs: four axis-1 runs, four axis-2 runs, and eight axis-3 runs. The preliminary run is reused as axis-1 k=1.
 
-
-### ARC-AGI-1 (assuming 4 H-100 GPUs):
+All settings are available through argparse; inspect them with:
 
 ```bash
-run_name="pretrain_att_arc1concept_4"
-torchrun --nproc-per-node 4 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 pretrain.py \
-arch=trm \
-data_paths="[data/arc1concept-aug-1000]" \
-arch.L_layers=2 \
-arch.H_cycles=3 arch.L_cycles=4 \
-+run_name=${run_name} ema=True
-
+python3 scripts/launch.py --help
+python3 scripts/launch.py --axis 1 --k 4 --dry-run
 ```
 
-*Runtime:* ~3 days
-
-### ARC-AGI-2 (assuming 4 H-100 GPUs):
+Explicit override example (also works without a profile plan):
 
 ```bash
-run_name="pretrain_att_arc2concept_4"
-torchrun --nproc-per-node 4 --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 pretrain.py \
-arch=trm \
-data_paths="[data/arc2concept-aug-1000]" \
-arch.L_layers=2 \
-arch.H_cycles=3 arch.L_cycles=4 \
-+run_name=${run_name} ema=True
-
+sbatch slurm/train.sbatch --axis 1 --k 4 --t 3 --width 256 --batch 768 --epochs 50000 --mode reduce-overhead
 ```
 
-*Runtime:* ~3 days
+Overrides bypass the profiled runtime/memory assumptions. Keep batch and epochs identical within an axis to attribute differences to k/T or weight sharing. Changing these arguments creates a distinct run identity. Seed is fixed to 0. The launcher cannot launch multiple configurations in one invocation.
 
+## 4. Exact experimental settings
 
-## Reference
+The pinned official TRM source is included in `vendor/TinyRecursiveModels`, commit `c01103738605ba39d1430519b1ee0c62f4c707f8`. `scripts/verify_vendor.py` checks every vendored source file. The vendor remains unmodified.
 
-If you find our work useful, please consider citing:
+**Data:** `sapientinc/sudoku-extreme`; download revision and raw-file hashes are saved. The native builder selects **1,000 original training puzzles** with NumPy seed 42, and applies **800 augmentations plus the original**, producing 801,000 stored training examples. Digit permutations, transpose and legal row/column permutations are unchanged. Native test split, **no test augmentation**. There is no ARC data in this experiment. The native sampler uses original puzzle groups: 800 instead of 1000 augmentations does **not** reduce the epoch-based update count by 20%.
 
-```bibtex
-@misc{jolicoeurmartineau2025morerecursivereasoningtiny,
-      title={Less is More: Recursive Reasoning with Tiny Networks}, 
-      author={Alexia Jolicoeur-Martineau},
-      year={2025},
-      eprint={2510.04871},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2510.04871}, 
-}
+**Architecture:** native bidirectional attention TRM, hidden width **256 instead of 512**, two attention/SwiGLU blocks, eight attention heads (head dimension 32), expansion 4 with native intermediate-dimension rounding, RoPE, BF16 forward. Puzzle embedding dimension is also 256; prefix length stays 16. The 81 Sudoku cells plus prefix give sequence length 97. Learned initialization states, input injection, normalization and output/halting heads are native. ACT maximum 16 supervision steps, exploration probability 0.1, `no_ACT_continue=True`. Evaluation always uses all 16 steps.
+
+**Notation:** the command-line `--k` is the paper table's k. Native `L_cycles=N=2k`; `--t` is `H_cycles=T`. Executed attention-block depth per supervision step is **2T(2k+1)**. At T=3, k=1/2/4/6 therefore gives depth 18/30/54/78. ACT's 16-step cap is separate from T.
+
+**Optimization:** native AdamATan2 for dense parameters, LR 1e-4, betas (0.9, 0.95), weight decay 1.0. Native distributed sparse SignSGD for puzzle embeddings, LR 1e-4 and weight decay 1.0. Linear LR warm-up over 2,000 optimizer updates; subsequent LR constant (`lr_min_ratio=1`). EMA rate 0.999. Native stablemax token-mean cross entropy plus 0.5 × halting loss. No added gradient clipping, accumulation or activation checkpointing. Global batch and epoch count come from the common plan; no LR scaling is applied when batch changes. The official starting schedule is 50,000 epochs, evaluation every 5,000; a shortened plan evaluates every `epochs/10`.
+
+**Compilation:** regular updates request `torch.compile(mode='reduce-overhead')`; `--mode default` and `--mode eager` are available. The wrapper copies outputs that must survive CUDA-graph iterations and handles EMA model copies. Diagnostic updates run eagerly on the same weights and optimizer. These changes have overhead; CUDA graphs may be skipped by PyTorch, and no 2× training speedup is assumed.
+
+## 5. What each axis tests
+
+**Axis 1:** native truncated-gradient TRM, N=2k varies; T=3, two blocks and width 256 stay fixed. **Axis 2:** native TRM, T varies at fixed k=3 unless explicitly changed. Choosing “best k” using test accuracy would leak test information: use the prespecified k=3, or establish a separate validation protocol before selecting another k. The code never automatically selects k from test results.
+
+**Axis 3:** same width, same native attention blocks, same z/y input-injection graph and same executed depth. `tied_full` reuses two blocks; `untied_full` gives each of the T(N+1) calls its own two blocks. Untied copies start with identical values but independent storage, so both arms initially compute the same function. Parameter counts differ deliberately and are saved for each run.
+
+Both axis-3 arms backpropagate through **all T cycles**. The official native model uses `no_grad` on the first T−1 cycles; retaining that rule in the untied model would leave early layers untrained. Thus compare the two axis-3 arms with each other. Axis 1/2 remain the native gradient protocol. The control removes inner-block weight sharing; it is a finite unrolled attention graph with TRM's skip connections, not a plain serial Transformer. The outer ACT supervision mechanism and detached carry between supervision steps remain the same in both arms.
+
+These are width-reduced, 800-augmentation, single-seed experiments, potentially with a changed batch and shorter schedule—not an exact reproduction of the paper's accuracy. Report the resolved configuration and final scheduled test accuracy; do not choose the best test checkpoint. One seed provides descriptive comparisons, not seed-level uncertainty or a guaranteed accuracy within ±2% of the paper.
+
+## 6. Checkpoints, accuracy and the three plots
+
+Each run has one directory under `results/`; its name includes k/T/arm/width/batch/epochs/mode/seed. The directory stores resolved hyperparameters, source/data fingerprints, dense/puzzle-table parameter counts, loss and diagnostics logs, ten evaluation records and plots.
+
+Full checkpoints alternate between two atomic generations every 1,000 updates, every 128 evaluation batches and at phase/deadline boundaries. They include model, optimizer, EMA, latent carry, RNG, sampler position and evaluation accumulation. An unexpected kill may lose work since the last committed checkpoint. `COMPLETE.json` appears only after the configured training schedule and all ten evaluations finish.
+
+A deadline saves a checkpoint and exits with pause status 4; **no next job is submitted automatically**. Resubmit the exact same command to resume with four GPUs. Do not change training source/data/config during a run. To request a clean manual pause, create a file named `STOP` in that run's result directory; remove only that flag before resuming.
+
+Diagnostics are taken on updates 1–10 and every 100 updates thereafter:
+
+1. `01_loss.png/pdf`: training LM/objective loss and EMA test loss.
+2. `02_latent_norms.png/pdf`: **z and y** gradient RMS and actual forward-state change RMS. These are two latent states; state change is distinct from gradient magnitude. Gradients are normalized to per-example loss, and ACT resets are excluded from the forward-change measurement.
+3. `03_layer_norms.png/pdf`: layer gradient RMS and actual optimizer weight-update norm relative to the weight norm. For untied models, the plot shows the median/range across copies of each block position; every individual layer is preserved in `diagnostics.csv`.
+
+Plots are generated after successful completion. To print saved test accuracy (whole-grid exact accuracy):
+
+```bash
+python3 scripts/results.py
 ```
 
-and the Hierarchical Reasoning Model (HRM):
+To plot a paused run inside an existing GPU allocation:
 
-```bibtex
-@misc{wang2025hierarchicalreasoningmodel,
-      title={Hierarchical Reasoning Model}, 
-      author={Guan Wang and Jin Li and Yuhao Sun and Xing Chen and Changling Liu and Yue Wu and Meng Lu and Sen Song and Yasin Abbasi Yadkori},
-      year={2025},
-      eprint={2506.21734},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2506.21734}, 
-}
+```bash
+export STUDY_ROOT="$PWD"
+source configs/cluster.env.sh
+bash scripts/container.sh scripts/repro_plot.py --run results/EXACT_RUN_DIRECTORY
 ```
 
-This code is based on the Hierarchical Reasoning Model [code](https://github.com/sapientinc/HRM) and the Hierarchical Reasoning Model Analysis [code](https://github.com/arcprize/hierarchical-reasoning-model-analysis).
+You can also plot copied results on any machine with NumPy and Matplotlib. Local CPU tests cover depth matching, gradients, argument mapping, checkpoint/resume and compilation-wrapper behavior. Actual CUDA compilation, memory fit and runtime must be validated by the supplied GH200 profiling job.
